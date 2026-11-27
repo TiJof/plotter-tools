@@ -7,6 +7,8 @@ treasure_maze.py - generate a treasure-hunt maze as an SVG.
 * --letter X (A-Z or 0-9) makes the SOLUTION trace that character: the route runs from the entrance to
   the middle of the maze, then hugs both sides of every stroke of a big pixel-font glyph, and ends
   next to where it entered (the chest is there).  The solution file shows it as an outlined letter.
+  The four card suits work too: --letter spade|heart|diamond|club (alias --symbol).  By default a suit is
+  filled with one continuous meander; --symbol-style outline traces just its contour.
   The rest of the maze grows around the letter as side branches, still with at most --max-children
   children per line.
 * The entrance is a gap on one side of the maze (add --start-arrow to mark it
@@ -35,6 +37,8 @@ Examples
   python treasure_maze.py 30x30cm --shape circle
   python treasure_maze.py A4 --letter R --start-arrow          # solution spells R
   python treasure_maze.py A3 --landscape --letter 7 --shape ellipse --cell 4
+  python treasure_maze.py A4 --symbol heart --start-arrow
+  python treasure_maze.py A4 --symbol spade --symbol-style outline --cell 4
 
 Sizes: ISO A0-A6, LETTER, LEGAL, or WIDTHxHEIGHT with a unit (mm, cm, in, m).
 A bare WIDTHxHEIGHT is read as millimetres.  All other lengths are in mm.
@@ -539,6 +543,74 @@ def glyph_cells(ch, s):
     return cells, 4 * s + 1, 6 * s + 1
 
 
+# Card suits are drawn as silhouettes (implicit curves) sampled on the coarse grid.  --symbol-style decides
+# whether the route traces only their outline or fills them completely.
+SYMBOL_ALIASES = {
+    "spade": "spade", "spades": "spade", "\u2660": "spade", "\u2664": "spade",
+    "heart": "heart", "hearts": "heart", "\u2665": "heart", "\u2661": "heart",
+    "diamond": "diamond", "diamonds": "diamond", "diam": "diamond", "\u2666": "diamond", "\u2662": "diamond",
+    "club": "club", "clubs": "club", "\u2663": "club", "\u2667": "club",
+}
+SYMBOL_ASPECT = {"spade": 0.84, "heart": 1.0, "diamond": 0.70, "club": 0.96}
+
+
+def _heart_in(x, y):                     # classic implicit heart, tip at y = -1, lobes at y ~ +1.2
+    return (x * x + y * y - 1) ** 3 - x * x * y ** 3 <= 0
+
+
+def _suit_inside(name, u, v, ar):
+    """Is the point (u, v) of the unit box (v downwards) inside the suit?  ar = width / height."""
+    if name == "diamond":
+        return abs(u - 0.5) / 0.5 + abs(v - 0.5) / 0.5 <= 1.0
+    if name == "heart":
+        return _heart_in((u - 0.5) * 2.3, 1.25 - v * 2.3)
+    x, y = (u - 0.5) * ar, v                                       # centred, in units of the height
+    if name == "spade":                                            # pointed top, two round lobes, flared stem
+        if y <= 0.55 and abs(x) <= 0.42 * (y / 0.55) ** 0.6:
+            return True
+        if any((x - cx) ** 2 + (y - 0.57) ** 2 <= 0.22 ** 2 for cx in (-0.20, 0.20)):
+            return True
+        if 0.40 <= y <= 0.65 and abs(x) <= 0.20:
+            return True
+        return y >= 0.62 and abs(x) <= 0.045 + 0.20 * max(0.0, (y - 0.82) / 0.18) ** 2
+    for cx, cy, r in ((0.0, 0.215, 0.215), (-0.265, 0.625, 0.215), (0.265, 0.625, 0.215), (0.0, 0.50, 0.12)):   # club
+        if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+            return True
+    return y >= 0.60 and abs(x) <= 0.05 + 0.20 * max(0.0, (y - 0.84) / 0.16) ** 1.5
+
+
+def symbol_cells(name, s, style):
+    """A suit as a set of coarse cells (height 6*s+1, like the letters of the same scale)."""
+    H = 6 * s + 1
+    W = max(3, round(SYMBOL_ASPECT[name] * H))
+    ar = W / H
+    subs = (1 / 6, 3 / 6, 5 / 6)                    # 3x3 supersampling keeps thin parts at low resolution
+    mask = {(i, j) for j in range(H) for i in range(W)
+            if sum(_suit_inside(name, (i + a) / W, (j + b) / H, ar) for a in subs for b in subs) >= 4}
+    if style != "solid":
+        mask = {(i, j) for (i, j) in mask if any((i + dx, j + dy) not in mask for dx in (-1, 0, 1) for dy in (-1, 0, 1))}
+    best, seen = set(), set()                      # keep the largest 4-connected piece (tiny sizes can split)
+    for start in sorted(mask):
+        if start in seen:
+            continue
+        comp, stack = set(), [start]
+        while stack:
+            c = stack.pop()
+            if c in comp:
+                continue
+            comp.add(c)
+            x, y = c
+            stack.extend(n for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)) if n in mask and n not in comp)
+        seen |= comp
+        if len(comp) > len(best):
+            best = comp
+    return best, W, H
+
+
+def shape_cells(ch, s, style):
+    return symbol_cells(ch, s, style) if ch in SYMBOL_ALIASES.values() else glyph_cells(ch, s)
+
+
 def glyph_cycle(S, rng):
     """One closed loop through the 2x2 fine cells of every coarse cell of S: it hugs both sides of a random
     spanning tree of S (the construction from continuous_maze.py), so it visits all 4*len(S) fine cells once."""
@@ -601,13 +673,13 @@ def glyph_cycle(S, rng):
     return cycle
 
 
-def plan_letter(ch, scale, cols, rows, active, entrance, rng):
+def plan_letter(ch, scale, cols, rows, active, entrance, rng, style="solid"):
     """Place the glyph in the middle of the maze and return the full solution path (entrance ... end of the
     letter) as a list of cell indices.  The path leads from the entrance straight to the glyph, then hugs
     every stroke of it, and ends right next to where it entered (the chest lives there)."""
     placed = None
     for sc in ([scale] if scale else range(14, 0, -1)):
-        S, bw, bh = glyph_cells(ch, sc)
+        S, bw, bh = shape_cells(ch, sc, style)
         cx0, cy0 = (cols // 2 - bw) // 2, (rows // 2 - bh) // 2
         if cx0 < 0 or cy0 < 0:
             continue
@@ -710,11 +782,15 @@ def main(argv=None) -> int:
                     help="treasure is at least this fraction of the longest route away (0-1)")
     ap.add_argument("--start-arrow", action=argparse.BooleanOptionalAction, default=False,
                     help="draw a green arrow pointing at the entrance (outside the maze)")
-    ap.add_argument("--letter", metavar="CHAR", default=None,
-                    help="make the solution trace a letter A-Z or digit 0-9 (writes the solution file too; "
-                         "the chest sits at the end of the letter)")
+    ap.add_argument("--letter", "--symbol", dest="letter", metavar="CHAR|SUIT", default=None,
+                    help="make the solution trace a letter A-Z, a digit 0-9 or a card suit "
+                         "(spade, heart, diamond, club) - writes the solution file too; "
+                         "the chest sits at the end of the shape")
+    ap.add_argument("--symbol-style", choices=("solid", "outline"), default="solid",
+                    help="card suits only: 'solid' fills the whole suit with one continuous meander, "
+                         "'outline' traces only its contour")
     ap.add_argument("--letter-scale", type=int, default=None, metavar="N",
-                    help="size of the letter in coarse cells per font pixel (default: the largest that fits)")
+                    help="size of the letter/suit (its height is 6N+1 coarse cells; default: the largest that fits)")
     ap.add_argument("--solution-width", type=float, default=None, metavar="FRAC",
                     help="width of the red route as a fraction of a cell (default 0.25, or 0.5 with --letter)")
     ap.add_argument("--solution", action="store_true",
@@ -742,9 +818,10 @@ def main(argv=None) -> int:
     if args.cell <= 0:
         ap.error("--cell must be positive")
     if args.letter is not None:
-        args.letter = args.letter.strip().upper()
-        if args.letter not in FONT:
-            ap.error("--letter takes a single character: A-Z or 0-9")
+        raw = args.letter.strip()
+        args.letter = SYMBOL_ALIASES.get(raw.lower(), raw.upper())
+        if args.letter not in FONT and args.letter not in SYMBOL_ALIASES.values():
+            ap.error("--letter takes a single character A-Z / 0-9, or a card suit: spade, heart, diamond, club")
         args.solution = True
         if args.letter_scale is not None and args.letter_scale < 1:
             ap.error("--letter-scale must be at least 1")
@@ -774,7 +851,8 @@ def main(argv=None) -> int:
 
     if args.letter:
         try:
-            path, letter_scale = plan_letter(args.letter, args.letter_scale, cols, rows, active, start, rng)
+            path, letter_scale = plan_letter(args.letter, args.letter_scale, cols, rows, active, start, rng,
+                                             args.symbol_style)
         except ValueError as e:
             ap.error(str(e))
         maze, adj, depth, parent = generate_letter(cols, rows, path, rng, args, active)
